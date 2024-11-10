@@ -22,12 +22,15 @@ from torcheval.metrics import Mean
 import fastcore.all as fc
 from fastprogress import progress_bar,master_bar
 
+from accelerate import Accelerator
+
 
 __all__ = ['accuracy', 'report', 'Dataset', 'fit', 'get_dls', 'inplace', 'collate_dict', 'show_image', 'subplots', 'get_grid', 'show_images', 'DataLoaders',
            'def_device', 'conv', 'to_device', 'collate_device', 'CancelFitException', 'CancelBatchException', 'CancelEpochException', 'Callback', 'run_cbs',
            'SingleBatchCB', 'to_cpu', 'MetricsCB', 'DeviceCB', 'TrainCB', 'ProgressCB', 'with_cbs', 'Learner', 'TrainLearner', 'MomentumLearner',
            'LRFinderCB', 'lr_find', 'set_seed', 'Hook', 'Hooks', 'HooksCallback', 'append_stats', 'get_hist', 'get_min', 'ActivationStats', 'clean_ipython_hist', 
-           'clean_tb', 'clean_mem', 'BatchTransformCB', 'GeneralRelu', 'plot_func', 'init_weights', 'lsuv_init', 'conv', 'get_model'
+           'clean_tb', 'clean_mem', 'BatchTransformCB', 'GeneralRelu', 'plot_func', 'init_weights', 'lsuv_init', 'conv', 'get_model', 'MixedPrecision', 'AccelerateCB',
+           'BaseSchedCB', 'BatchSchedCB', 'HasLearnCB', 'RecorderCB', 'EpochSchedCB'
            ]
 
 def accuracy(out, yb): return (out.argmax(dim=1)==yb).float().mean()
@@ -522,3 +525,68 @@ def get_model(act=nn.ReLU, nfs=None, norm=None):
     layers = [conv(nfs[i], nfs[i+1], act=act, norm=norm) for i in range(len(nfs)-1)]
     return nn.Sequential(*layers, conv(nfs[-1],10, act=None, norm=False, bias=True),
                          nn.Flatten()).to(def_device)
+
+
+class MixedPrecision(TrainCB):
+    order = DeviceCB.order+10
+    
+    def before_fit(self, learn): self.scaler = torch.cuda.amp.GradScaler()
+
+    def before_batch(self, learn):
+        self.autocast = torch.autocast("cuda", dtype=torch.float16)
+        self.autocast.__enter__()
+
+    def after_loss(self, learn): self.autocast.__exit__(None, None, None)
+        
+    def backward(self, learn): self.scaler.scale(learn.loss).backward()
+
+    def step(self, learn):
+        self.scaler.step(learn.opt)
+        self.scaler.update()
+
+
+class AccelerateCB(TrainCB):
+    order = DeviceCB.order+10
+    def __init__(self, n_inp=1, mixed_precision="fp16"):
+        super().__init__(n_inp=n_inp)
+        self.acc = Accelerator(mixed_precision=mixed_precision)
+        
+    def before_fit(self, learn):
+        learn.model,learn.opt,learn.dls.train,learn.dls.valid = self.acc.prepare(
+            learn.model, learn.opt, learn.dls.train, learn.dls.valid)
+
+    def backward(self, learn): self.acc.backward(learn.loss)
+
+
+class BaseSchedCB(Callback):
+    def __init__(self, sched): self.sched = sched
+    def before_fit(self, learn): self.schedo = self.sched(learn.opt)
+    def _step(self, learn):
+        if learn.training: self.schedo.step()
+
+class BatchSchedCB(BaseSchedCB):
+    def after_batch(self, learn): self._step(learn)
+
+class HasLearnCB(Callback):
+    def before_fit(self, learn): self.learn = learn 
+    def after_fit(self, learn): self.learn = None
+
+class RecorderCB(Callback):
+    def __init__(self, **d): self.d = d
+    def before_fit(self, learn):
+        self.recs = {k:[] for k in self.d}
+        self.pg = learn.opt.param_groups[0]
+    
+    def after_batch(self, learn):
+        if not learn.training: return
+        for k,v in self.d.items():
+            self.recs[k].append(v(self))
+
+    def plot(self):
+        for k,v in self.recs.items():
+            plt.plot(v, label=k)
+            plt.legend()
+            plt.show()
+
+class EpochSchedCB(BaseSchedCB):
+    def after_epoch(self, learn): self._step(learn)
