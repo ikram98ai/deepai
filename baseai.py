@@ -30,8 +30,10 @@ __all__ = ['accuracy', 'report', 'Dataset', 'fit', 'get_dls', 'inplace', 'collat
            'SingleBatchCB', 'to_cpu', 'MetricsCB', 'DeviceCB', 'TrainCB', 'ProgressCB', 'with_cbs', 'Learner', 'TrainLearner', 'MomentumLearner',
            'LRFinderCB', 'lr_find', 'set_seed', 'Hook', 'Hooks', 'HooksCallback', 'append_stats', 'get_hist', 'get_min', 'ActivationStats', 'clean_ipython_hist', 
            'clean_tb', 'clean_mem', 'BatchTransformCB', 'GeneralRelu', 'plot_func', 'init_weights', 'lsuv_init', 'conv', 'get_model', 'MixedPrecision', 'AccelerateCB',
-           'BaseSchedCB', 'BatchSchedCB', 'HasLearnCB', 'RecorderCB', 'EpochSchedCB'
+           'BaseSchedCB', 'BatchSchedCB', 'HasLearnCB', 'RecorderCB', 'EpochSchedCB', 'act_gr', 'ResBlock'
            ]
+
+
 
 def accuracy(out, yb): return (out.argmax(dim=1)==yb).float().mean()
 
@@ -590,3 +592,22 @@ class RecorderCB(Callback):
 
 class EpochSchedCB(BaseSchedCB):
     def after_epoch(self, learn): self._step(learn)
+
+
+
+act_gr = partial(GeneralRelu, leak=0.1, sub=0.4)
+
+def _conv_block(ni, nf, stride, act=act_gr, norm=None, ks=3):
+    return nn.Sequential(conv(ni, nf, stride=1, act=act, norm=norm, ks=ks),
+                         conv(nf, nf, stride=stride, act=None, norm=norm, ks=ks))
+
+class ResBlock(nn.Module):
+    def __init__(self, ni, nf, stride=1, ks=3, act=act_gr, norm=None):
+        super().__init__()
+        self.convs = _conv_block(ni, nf, stride, act=act, ks=ks, norm=norm)
+        self.idconv = fc.noop if ni==nf else conv(ni, nf, ks=1, stride=1, act=None)
+        self.pool = fc.noop if stride==1 else nn.AvgPool2d(2, ceil_mode=True)
+        self.act = act()
+
+    def forward(self, x): return self.act(self.convs(x) + self.idconv(self.pool(x)))
+
