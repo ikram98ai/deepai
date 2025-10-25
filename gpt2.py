@@ -32,11 +32,12 @@ class CasualSelfAttention(nn.Module):
         k = k.view(B,T, self.n_head, C//self.n_head).transpose(1,2)
         v = v.view(B,T, self.n_head, C//self.n_head).transpose(1,2)
 
-        att = q @ k.transpose(-2,-1) * k.size(-1)**-0.5 # (B,nh,T,hs) @ (B,nh,hs,T) -> (B,nh,T,T)
-        att = att.masked_fill(att[:,:,:T,:T]==0, float("-inf"))
-        att = F.softmax(att, dim=-1)
+        # att = q @ k.transpose(-2,-1) * k.size(-1)**-0.5 # (B,nh,T,hs) @ (B,nh,hs,T) -> (B,nh,T,T)
+        # att = att.masked_fill(att[:,:,:T,:T]==0, float("-inf"))
+        # att = F.softmax(att, dim=-1)
+        # out = att @ v # (B,nh,T,T) @ (B,nh,T,hs) -> (B,nh,T,hs)
+        out = F.scaled_dot_product_attention(q,k,v, is_causal=True) # optimization
 
-        out = att @ v # (B,nh,T,T) @ (B,nh,T,hs) -> (B,nh,T,hs)
         out = out.transpose(1,2).contiguous().view(B,T,C)
         out = self.c_proj(out)
         return out
@@ -187,16 +188,19 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 torch.manual_seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(42)
+# torch.set_float32_matmul_precision('high') # optimization
 
 train_loader = DataLoaderLite(B=4,T=32)
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304)) # optimization
 model.to(device)
+# model = torch.compile(model) # optimization
 optimizer = torch.optim.AdamW(model.parameters(),lr=3e-4)
 for i in range(20):
     t0 = time.time()
     x,y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
+    # with torch.autocast(device_type=device, dtype=torch.float16): # optimization
     logits,loss = model(x,y)
     loss.backward()
     optimizer.step()
