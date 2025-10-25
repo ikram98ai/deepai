@@ -18,6 +18,7 @@ class CasualSelfAttention(nn.Module):
         super().__init__()
         self.c_attn = nn.Linear(config.n_embd, 3*config.n_embd)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.GPT_SCALE_INIT = 1
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.register_buffer('bias', torch.tril(torch.ones(config.block_size, config.block_size)
@@ -46,7 +47,8 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4*config.n_embd)
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4*config.n_embd, config.n_embd)
-    
+        self.c_proj.GPT_SCALE_INIT = 1
+
     def forward(self, x):
         x = self.c_fc(x)
         x = self.gelu(x)
@@ -78,6 +80,22 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(self.config.n_embd)
         ))
         self.lm_head = nn.Linear(self.config.n_embd, self.config.vocab_size, bias=False)
+        self.transformer.wte.weight = self.lm_head.weight
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'GPT_SCALE_INIT'):
+                std *= (2*self.config.n_layer) **-0.5 
+            nn.init.normal_(module.weight,mean=0,std=std)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight,mean=0,std=0.02)
+
 
     def forward(self, idx, target=None):
         B,T = idx.shape
@@ -85,9 +103,9 @@ class GPT(nn.Module):
         pos = torch.arange(0,T, dtype=torch.long, device=idx.device)
         pos_emb = self.transformer.wpe(pos)
         tok_emb = self.transformer.wte(idx)
-        emb = tok_emb + pos_emb
+        x = tok_emb + pos_emb
         for block in self.transformer.h:
-            x = block(emb) 
+            x = block(x) 
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
         loss=None
@@ -136,40 +154,67 @@ class GPT(nn.Module):
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k])
         return model
-    
-
-############################################################################################################
 
 import tiktoken
-device = "cuda" if torch.cuda.is_available() else "cpu"
 enc = tiktoken.get_encoding('gpt2')
+class DataLoaderLite:
+    def __init__(self,B,T):
+        self.B = B
+        self.T = T
+        with open('data/shakespeares.txt','r') as f:
+            text = f.read()
 
-with open('data/shakespeares.txt','r') as f:
-    text = f.read()
+        self.tokens = torch.tensor(enc.encode(text))
+        self.current_position = 0
 
-text = text[:1000]
-tokens = enc.encode(text)
-B,T = 4, 32
-buf = torch.tensor(tokens[:B*T+1])
-buf = buf.to(device)
-x = buf[:-1].view(B,T)
-y = buf[1:].view(B,T)
+        print(f"Total tokens= {len(self.tokens)}")
+        print(f"1 epoch= {len(self.tokens)//(B*T)} batches")
 
+    def next_batch(self):
+        buf = self.tokens[self.current_position: self.current_position + self.B*self.T+1]
+        x = buf[:-1].view(self.B,self.T)
+        y = buf[1:].view(self.B,self.T)
+
+        self.current_position += self.B*self.T
+        if self.current_position + (self.B*self.T+1) > len(self.tokens):
+            self.current_position = 0
+        return x,y
+
+
+############################################################################################################
+import time 
+device = "cuda" if torch.cuda.is_available() else "cpu"
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(42)
+
+train_loader = DataLoaderLite(B=4,T=32)
 model = GPT(GPTConfig())
 model.to(device)
 optimizer = torch.optim.AdamW(model.parameters(),lr=3e-4)
 for i in range(20):
+    t0 = time.time()
+    x,y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
     logits,loss = model(x,y)
     loss.backward()
     optimizer.step()
-    print(f"step {i}, loss: {loss.item()}")
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0) * 1000
+    tok_per_sec = (train_loader.B*train_loader.T) / (t1-t0)
+    print(f"step {i}, loss: {loss.item()}, dt:{dt:.2f}ms, tok/sec: {tok_per_sec:.2f}")
+
+
+
 
 import sys; sys.exit(0)
 
 num_return_sequences = 5
 max_tokens = 30
-# model = GPT.from_pretrained("gpt2")
+model = GPT.from_pretrained("gpt2")
 model.eval()
 
 tokens = enc.encode("Hello, I'm a language model,")
@@ -178,11 +223,9 @@ tokens = tokens.unsqueeze(0).repeat(num_return_sequences,1)
 
 x = tokens.to(device)
 
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
 while x.size(1) < max_tokens:
     with torch.no_grad():
-        logits = model(x)
+        logits, loss = model(x)
         logits = logits[:,-1,:]
         probs = F.softmax(logits, dim=-1)
         topk_probs, topk_indices = torch.topk(probs, k=50, dim=-1)
