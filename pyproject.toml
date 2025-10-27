@@ -1,0 +1,28 @@
+[project]
+name = "deepai"
+version = "0.1.0"
+description = "Impelmenting deeplearning models from scratch"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "accelerate>=1.11.0",
+    "fastcore>=1.8.13",
+    "fastprogress>=1.0.3",
+    "matplotlib>=3.10.7",
+    "tiktoken>=0.12.0",
+    "torch>=2.7.0",
+    "torcheval>=0.0.7",
+    "torchvision>=0.24.0",
+    "transformers>=4.57.1",
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu" },
+]
+
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
