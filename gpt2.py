@@ -181,14 +181,17 @@ class GPT(nn.Module):
 import tiktoken
 enc = tiktoken.get_encoding('gpt2')
 class DataLoaderLite:
-    def __init__(self,B,T):
+    def __init__(self,B,T, process_rank, num_processes):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+
         with open('data/shakespeares.txt','r') as f:
             text = f.read()
 
         self.tokens = torch.tensor(enc.encode(text))
-        self.current_position = 0
+        self.current_position = self.B * self.T * process_rank
 
         print(f"Total tokens= {len(self.tokens)}")
         print(f"1 epoch= {len(self.tokens)//(B*T)} batches")
@@ -198,15 +201,42 @@ class DataLoaderLite:
         x = buf[:-1].view(self.B,self.T)
         y = buf[1:].view(self.B,self.T)
 
-        self.current_position += self.B*self.T
-        if self.current_position + (self.B*self.T+1) > len(self.tokens):
-            self.current_position = 0
+        self.current_position += self.B * self.T * self.num_processes
+        if self.current_position + (self.B * self.T * self.num_processes + 1) > len(self.tokens):
+            self.current_position = self.B * self.T * self.process_rank
         return x,y
 
 
-############################################################################################################
-import time 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+################################################################# Training #################################################################
+# DDP launch: torchrun --standalone --nproc_per_node=8 gpt2.py
+import time, os
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+
+ddp = int(os.environ.get("RANK",-1)) != -1
+if ddp:
+    assert torch.cuda.is_available(), "We need GPU for ddp."
+    init_process_group(backend="nncl")
+    ddp_rank = os.environ.get("RANK")
+    ddp_local_rank = os.environ.get("LOCAL_RANK")
+    ddp_world_size = os.environ.get("WORLD_SIZE")
+    device = f"cuda:{ddp_local_rank}"
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0
+else:
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+
+    device = 'cpu'
+    if torch.cuda.is_available():
+        device = 'cuda'
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        device = 'mps'
+    print("device:",device)
+
 torch.manual_seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(42)
@@ -214,17 +244,21 @@ if torch.cuda.is_available():
 total_batch_size = 524288 # 2**19 = ~0.5M, in number of tokens
 B = 4 # micro batch
 T = 32 # sequence length
-assert total_batch_size % (B*T) == 0, "make sure total_batch_size is divisble by B*T"
-grad_accum_steps = 4 # total_batch_size//(B*T)
-print(f"total desired batch size: {total_batch_size}")
-print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+assert total_batch_size % (B*T * ddp_world_size) == 0, "make sure total_batch_size is divisble by B*T*ddp_world_size"
+grad_accum_steps = 4 # total_batch_size//(B*T *ddp_world_size)
+if master_process:
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-train_loader = DataLoaderLite(B=B,T=T)
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
 
-# torch.set_float32_matmul_precision('high') # optimization
+torch.set_float32_matmul_precision('high') # optimization
 model = GPT(GPTConfig(vocab_size=50304)) # optimization
 model.to(device)
 # model = torch.compile(model) # optimization
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
@@ -242,7 +276,7 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff*(max_lr-min_lr)
 
-optimizer = model.configure_optimizer(0.1, max_lr, device)
+optimizer = raw_model.configure_optimizer(0.1, max_lr, device)
 for i in range(10):
     t0 = time.time()
     optimizer.zero_grad()
@@ -254,7 +288,11 @@ for i in range(10):
         logits,loss = model(x,y)
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
+        if ddp:
+            model.require_backward_grad_sync = micro_step == (grad_accum_steps-1)
         loss.backward()
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     norm = nn.utils.clip_grad_norm_(model.parameters(),1)
     lr = get_lr(i)
     for param_group in optimizer.param_groups:
@@ -265,11 +303,13 @@ for i in range(10):
         torch.cuda.synchronize()
     t1 = time.time()
     dt = t1 - t0
-    tok_per_sec = (train_loader.B * train_loader.T * grad_accum_steps) / dt
-    print(f"step {i:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt:{(dt*1000):.2f}ms | tok/sec: {tok_per_sec:.2f}s")
+    tok_per_sec = (train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size) / dt
+    if master_process:
+        print(f"step {i:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt:{(dt*1000):.2f}ms | tok/sec: {tok_per_sec:.2f}s")
 
 
-
+if ddp:
+    destroy_process_group()
 
 # import sys; sys.exit(0)
 
