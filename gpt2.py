@@ -179,31 +179,49 @@ class GPT(nn.Module):
         return optimizer
 
 import tiktoken
+import numpy as np
 enc = tiktoken.get_encoding('gpt2')
+
+def load_tokens(filename):
+    tokens = np.load(filename)
+    return torch.tensor(tokens, dtype=torch.long)
+
 class DataLoaderLite:
-    def __init__(self,B,T, process_rank, num_processes):
+    def __init__(self,B,T, process_rank, num_processes, split):
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
+        assert split in ['train','val']
 
-        with open('data/shakespeares.txt','r') as f:
-            text = f.read()
-
-        self.tokens = torch.tensor(enc.encode(text))
+        data_root = 'data/'
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root,s) for s in shards]
+        self.shards = shards
+        assert len(shards) > 0, f"No data shards found for split {split}"
+        if master_process:
+            print(f"found {len(shards)} data shards for split {split}: {shards}")
+        
+        self.current_shard = 0
+        self.tokens = load_tokens(shards[self.current_shard])
         self.current_position = self.B * self.T * process_rank
 
         print(f"Total tokens= {len(self.tokens)}")
         print(f"1 epoch= {len(self.tokens)//(B*T)} batches")
 
     def next_batch(self):
-        buf = self.tokens[self.current_position: self.current_position + self.B*self.T+1]
-        x = buf[:-1].view(self.B,self.T)
-        y = buf[1:].view(self.B,self.T)
+        B,T = self.B, self.T
+        buf = self.tokens[self.current_position: self.current_position + B*T+1]
+        x = buf[:-1].view(B,T)
+        y = buf[1:].view(B,T)
 
-        self.current_position += self.B * self.T * self.num_processes
-        if self.current_position + (self.B * self.T * self.num_processes + 1) > len(self.tokens):
-            self.current_position = self.B * self.T * self.process_rank
+        self.current_position += B * T * self.num_processes
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = B * T * self.process_rank
         return x,y
 
 
@@ -250,7 +268,7 @@ if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split='train')
 
 torch.set_float32_matmul_precision('high') # optimization
 model = GPT(GPTConfig(vocab_size=50304)) # optimization
@@ -262,8 +280,8 @@ raw_model = model.module if ddp else model
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 5
-max_steps = 50
+warmup_steps = 5 # 375e6 warm up tokens / 2^19 per step tokens = 715 steps
+max_steps = 50 # 10e9 total tokens / 2^19 per step tokens = 19073 steps
 
 def get_lr(it):
     if it < warmup_steps:
